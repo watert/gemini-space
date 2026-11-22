@@ -14,7 +14,8 @@
   "packageManager": "pnpm@11.25.0",
   "bin": {
     "gemini-space": "bin/gemini-space.js",
-    "devspace": "bin/devspace.js"
+    "devspace": "bin/devspace.js",
+    "gemini-space-stdio": "bin/gemini-space-stdio.js"
   },
   "files": [
     "bin",

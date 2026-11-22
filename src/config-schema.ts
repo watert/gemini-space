@@ -31,7 +31,7 @@ const agyConfigSchema = z.object({
   agyHome: z.string().trim().min(1).optional(),
   modelId: z.string().trim().min(1).default("gemini-3.1-pro-preview"),
   wireProtocol: z.enum(["genai", "openai"]).default("genai"),
-  holdMs: z.number().int().min(1_000).max(58_000).default(45_000),
+  holdMs: z.number().int().min(1_000).max(58_000).default(30_000),
   callTimeoutMs: z.number().int().min(5_000).max(120_000).default(50_000),
   maxTurnsPerSession: z.number().int().min(5).max(1_000).default(80),
   sessionIdleTtlMs: z.number().int().min(60_000).max(24 * 60 * 60_000).default(30 * 60_000),
@@ -44,7 +44,7 @@ const skillsConfigSchema = z.object({
 }).passthrough().prefault({});
 
 const codeModeConfigSchema = z.object({
-  enabled: z.boolean().default(true),
+  enabled: z.boolean().default(false),
 }).passthrough().prefault({});
 
 const uiConfigSchema = z.object({

@@ -26,6 +26,11 @@ import type { AgyBridgeConfig } from "./config.js";
 import { commandPreview, logEvent, type LoggingConfig } from "./logger.js";
 import { cleanGeminiToolSchema } from "./schema-clean.js";
 
+// 资源回收上限：防止 daemon/后台任务持续产出通知与记录，导致 session 永不回收、内存无界增长。
+const MAX_NOTICES_PER_SESSION = 200;
+const MAX_COMPLETED_TASKS = 200;
+const MAX_ACTIVE_SESSIONS = 64;
+
 export type { AgyFunctionDeclaration };
 
 export interface ExposedMcpTool {
@@ -77,6 +82,21 @@ class McpSessionEntry implements SessionTaskContext {
 
   pushNotice(notice: SessionNoticeItem): void {
     this.notices.push(notice);
+    while (this.notices.length > MAX_NOTICES_PER_SESSION) {
+      // 优先丢弃已送达的最旧通知；全部未送达时才丢弃最旧的一条。
+      const oldestDelivered = this.notices.findIndex((n) => n.delivered);
+      this.notices.splice(oldestDelivered >= 0 ? oldestDelivered : 0, 1);
+    }
+  }
+
+  pruneCompletedTasks(): void {
+    const completed = [...this.tasksByStep.values()]
+      .filter((t) => t.status !== "RUNNING")
+      .sort((a, b) => a.stepIndex - b.stepIndex);
+    const excess = completed.length - MAX_COMPLETED_TASKS;
+    for (let i = 0; i < excess; i += 1) {
+      this.tasksByStep.delete(completed[i]!.stepIndex);
+    }
   }
 
   markNoticeDelivered(sender: string): void {
@@ -214,6 +234,13 @@ export class AgyBridge {
     const args = rawArgs ?? {};
     const targetEntry = this.resolveTargetSession(mcpSessionId, name, args);
     targetEntry.lastUsedAt = Date.now();
+    const turnLimit = this.config.maxTurnsPerSession;
+    if (targetEntry.currentStepCount() > turnLimit) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: `session turn limit (${turnLimit}) reached; start a new session` }],
+      };
+    }
     const callStart = Date.now();
 
     const execute = async (): Promise<BridgeToolCallResult> => {
@@ -259,6 +286,7 @@ export class AgyBridge {
         }
       }
 
+      targetEntry.pruneCompletedTasks();
       const extraNotices = targetEntry.takeFreshNotices(suppressNoticeForTask);
       const content: McpContentBlock[] = [
         { type: "text", text: outText + extraNotices },
@@ -325,6 +353,20 @@ export class AgyBridge {
     const key = trimmedMcpId || "stateless";
     let entry = this.mcpSessions.get(key);
     if (!entry) {
+      if (this.mcpSessions.size >= MAX_ACTIVE_SESSIONS) {
+        const victim = [...this.mcpSessions.values()]
+          .filter((candidate) => !candidate.hasRunningTasks())
+          .sort((a, b) => a.lastUsedAt - b.lastUsedAt)[0];
+        if (victim) {
+          this.sessionsByUuid.delete(victim.sessionUuid);
+          this.mcpSessions.delete(victim.mcpSessionId);
+        } else {
+          logEvent(this.logging, "warn", "active_session_limit_exceeded", {
+            activeSessions: this.mcpSessions.size,
+            limit: MAX_ACTIVE_SESSIONS,
+          });
+        }
+      }
       entry = new McpSessionEntry(key, this.config.agyHome, this.config.workspace);
       this.mcpSessions.set(key, entry);
       this.sessionsByUuid.set(entry.sessionUuid, entry);

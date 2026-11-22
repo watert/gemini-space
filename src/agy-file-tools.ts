@@ -6,6 +6,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   statSync,
   writeFileSync,
   writeSync,
@@ -27,6 +28,8 @@ export interface FileToolExecutionOutput {
 const MAX_READ_LINES = 800;
 const MAX_READ_BYTES = 46_080;
 const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024; // 100 MiB
+const MAX_HEADER_BYTES = 512; // 头部嗅探缓冲：所有 magic 都在前 512 字节内
+const MAX_MEDIA_BYTES = 8 * 1024 * 1024; // 8 MiB：超过则不再 base64 内联
 
 function parseAbsoluteToolPath(rawPath: string): string {
   if (rawPath.startsWith("file://")) {
@@ -52,6 +55,7 @@ function cleanDisplayPath(rawPath: string): string {
   return cleaned;
 }
 
+// 只接收文件头部缓冲（前 512 字节）即可判定：现有 magic 均落在前 12 字节内
 function sniffMultimodalMime(buf: Buffer, filePath: string): string | null {
   if (buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
     return "image/png";
@@ -191,6 +195,41 @@ function sliceRenderedBlob(blob: string, starts: number[], offset: number, slice
   return out;
 }
 
+// 只读文件头部小缓冲；读完即关闭 fd，避免为嗅探付出整文件读取的代价
+function readFileHeader(resolvedPath: string): Buffer {
+  const header = Buffer.alloc(MAX_HEADER_BYTES);
+  let fd: number;
+  try {
+    fd = openSync(resolvedPath, "r");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EACCES" || code === "EPERM") {
+      throw new AgyToolExecutionError(`failed to read file: open ${resolvedPath}: permission denied`);
+    }
+    throw new AgyToolExecutionError(`failed to read file: ${(err as Error).message}`);
+  }
+  let bytesRead = 0;
+  try {
+    bytesRead = readSync(fd, header, 0, MAX_HEADER_BYTES, 0);
+  } finally {
+    closeSync(fd);
+  }
+  return header.subarray(0, bytesRead);
+}
+
+// 确认是媒体或确认是文本后，才走原有整文件读取与错误文案
+function readWholeFile(resolvedPath: string): Buffer {
+  try {
+    return readFileSync(resolvedPath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EACCES" || code === "EPERM") {
+      throw new AgyToolExecutionError(`failed to read file: open ${resolvedPath}: permission denied`);
+    }
+    throw new AgyToolExecutionError(`failed to read file: ${(err as Error).message}`);
+  }
+}
+
 export function executeReadFile(args: Record<string, unknown>): FileToolExecutionOutput {
   const rawPath = String(args.Path ?? "");
   if (rawPath === "") {
@@ -250,31 +289,46 @@ export function executeReadFile(args: Record<string, unknown>): FileToolExecutio
   }
 
   const created = formatAgyTimestamp();
-  let raw: Buffer;
-  try {
-    raw = readFileSync(resolvedPath);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "EACCES" || code === "EPERM") {
-      throw new AgyToolExecutionError(`failed to read file: open ${resolvedPath}: permission denied`);
+  // 两段式读：先只读 512 字节头部用于嗅探，避免为了判定类型把整文件读进内存
+  const fileHeader = readFileHeader(resolvedPath);
+
+  const mediaMime = sniffMultimodalMime(fileHeader, resolvedPath);
+  if (mediaMime) {
+    // 媒体超过上限时拒绝内联，防止 base64 结果撑爆模型上下文
+    if (st.size > MAX_MEDIA_BYTES) {
+      throw new AgyToolExecutionError(
+        `file too large for inline media (${st.size} bytes > 8 MiB); use run_command with a tool like sips/ffprobe to inspect`,
+      );
     }
-    throw new AgyToolExecutionError(`failed to read file: ${(err as Error).message}`);
+    const media = readWholeFile(resolvedPath);
+    const completed = formatAgyTimestamp();
+    return {
+      text: `Created At: ${created}\nCompleted At: ${completed}\nShowing binary file of type ${mediaMime}`,
+      images: [{ mimeType: mediaMime, data: media.toString("base64") }],
+    };
   }
+
+  // 非媒体 magic 但头部含 NUL：按未知二进制拒读，不猜编码
+  // （UTF-16 文本同样含 NUL，一律拒读；仅在有 BOM 时补一句说明，不做解码）
+  if (fileHeader.includes(0x00)) {
+    let message =
+      "binary file detected (no inline media support for this type); refusing to render as text";
+    if (
+      (fileHeader[0] === 0xff && fileHeader[1] === 0xfe)
+      || (fileHeader[0] === 0xfe && fileHeader[1] === 0xff)
+    ) {
+      message += " (UTF-16 text contains NUL bytes and is not decoded)";
+    }
+    throw new AgyToolExecutionError(message);
+  }
+
+  const raw = readWholeFile(resolvedPath);
 
   if (raw.length === 0) {
     const completed = formatAgyTimestamp();
     return {
       text: `Created At: ${created}\nCompleted At: ${completed}\nFile is empty`,
       images: [],
-    };
-  }
-
-  const mediaMime = sniffMultimodalMime(raw, resolvedPath);
-  if (mediaMime) {
-    const completed = formatAgyTimestamp();
-    return {
-      text: `Created At: ${created}\nCompleted At: ${completed}\nShowing binary file of type ${mediaMime}`,
-      images: [{ mimeType: mediaMime, data: raw.toString("base64") }],
     };
   }
 

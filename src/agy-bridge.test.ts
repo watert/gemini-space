@@ -562,7 +562,7 @@ test("deterministic agy 1.5.10 parity contracts: validation, read_file paginatio
   await writeFile(binPath, Buffer.from([0x00, 0xff, 0xfe, 0x01]));
   const rBin = await bridge.callTool("s1", "read_file", { Path: binPath });
   assert.equal(rBin.isError, true);
-  assert.match((rBin.content[0] as { text: string }).text, /appears to be a binary file/);
+  assert.match((rBin.content[0] as { text: string }).text, /binary file detected/);
 
   // 6. run_command: true PTY (isatty + CRLF), real user HOME inheritance, and 10,240-byte middle truncation
   const ptyCheck = await bridge.callTool("s1", "run_command", {

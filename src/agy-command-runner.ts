@@ -1,5 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -10,6 +10,11 @@ import {
 
 const MAX_TOOL_OUTPUT_BYTES = 10_240;
 const TAIL_PREVIEW_BYTES = 1_000;
+// 内存捕获上限：头 32KiB 固定，尾部滚动到 512KiB；模型只看这段，磁盘另算。
+const MAX_CAPTURED_BYTES = 512 * 1024;
+const CAPTURE_HEAD_BYTES = 32 * 1024;
+// 磁盘全量输出硬上限，超过即停止追加（64MiB）。
+const MAX_OUTPUT_FILE_BYTES = 64 * 1024 * 1024;
 
 // 7-bit ANSI CSI, OSC, and 2-char ESC sequences (preserves \r, \n, \t, \b, \x07)
 const ANSI_ESCAPE_RE =
@@ -142,6 +147,18 @@ export function stripAnsiAndDecode(raw: Buffer): string {
   return decoded.replace(ANSI_ESCAPE_RE, "");
 }
 
+// 找出最后一个完整 ANSI 序列的结束位置，用于定位末尾可能出现的不完整转义。
+function lastCompleteAnsiEnd(text: string): number {
+  ANSI_ESCAPE_RE.lastIndex = 0;
+  let end = 0;
+  let match: RegExpExecArray | null;
+  while ((match = ANSI_ESCAPE_RE.exec(text)) !== null) {
+    end = match.index + match[0].length;
+  }
+  ANSI_ESCAPE_RE.lastIndex = 0;
+  return end;
+}
+
 function encodeFileUri(absPath: string): string {
   return pathToFileURL(absPath).href;
 }
@@ -165,17 +182,37 @@ function trimTailUtf8(buf: Buffer, maxBytes: number): string {
 }
 
 /**
- * Truncates formatted tool output exceeding 10,240 bytes using `agy 1.5.10`'s exact middle-cut formula
- * and saves the full output to `outputTxtPath`.
+ * 按原有 10KiB 中间截断规则生成模型可见文本；output.txt 由流式追加落盘，不再整体重写。
  */
 export function truncateAndPersistOutput(fullText: string, outputTxtPath: string): string {
-  const fullBuf = Buffer.from(fullText, "utf8");
+  // 捕获丢弃量由调用方以首行标记传入，不参与 head/tail 截断公式。
+  const droppedMatch = /^<dropped (\d+) bytes>\n/.exec(fullText);
+  const droppedBytes = droppedMatch ? Number(droppedMatch[1]) : 0;
+  const text = droppedMatch ? fullText.slice(droppedMatch[0].length) : fullText;
+  const fullBuf = Buffer.from(text, "utf8");
   mkdirSync(join(outputTxtPath, ".."), { recursive: true });
-  writeFileSync(outputTxtPath, fullBuf);
+  if (!existsSync(outputTxtPath)) writeFileSync(outputTxtPath, "");
+
+  let fileSize = 0;
+  try {
+    fileSize = statSync(outputTxtPath).size;
+  } catch {
+    // 落盘文件不可读时按 0 处理
+  }
+  // 直接调用（无流式追加）时保留旧落盘行为；流式路径文件非空则不重写。
+  if (fileSize === 0 && fullBuf.length > 0) {
+    const persisted = fullBuf.subarray(0, MAX_OUTPUT_FILE_BYTES);
+    writeFileSync(outputTxtPath, persisted);
+    fileSize = persisted.length;
+  }
+  const logTruncated = fileSize >= MAX_OUTPUT_FILE_BYTES;
+  const notes =
+    (logTruncated ? `log truncated at ${MAX_OUTPUT_FILE_BYTES} bytes; full output stops there.\n` : "") +
+    (droppedBytes > 0 ? `dropped ${droppedBytes} bytes from captured output.\n` : "");
 
   const totalBytes = fullBuf.length;
   if (totalBytes <= MAX_TOOL_OUTPUT_BYTES) {
-    return fullText;
+    return `${notes}${text}`;
   }
 
   const fileUri = encodeFileUri(outputTxtPath);
@@ -190,7 +227,7 @@ export function truncateAndPersistOutput(fullText: string, outputTxtPath: string
   const tail = trimTailUtf8(fullBuf, half);
   const removed = totalBytes - Buffer.byteLength(head, "utf8") - Buffer.byteLength(tail, "utf8");
 
-  return `${prefix}${head}\n<truncated ${removed} of ${totalBytes} bytes from the middle of the output>\n${tail}`;
+  return `${notes}${prefix}${head}\n<truncated ${removed} of ${totalBytes} bytes from the middle of the output>\n${tail}`;
 }
 
 /**
@@ -301,11 +338,83 @@ export interface ManagedTaskRecord {
   stepOutputPath: string;
   cleanChunks: Buffer[];
   cleanByteLength: number;
+  // 有界捕获丢弃的中间字节数。
+  droppedBytes?: number;
   proc: ChildProcess;
   shellPid?: number;
   backgrounded: boolean;
   fullResultDeliveredViaStatus: boolean;
   waiters: Set<() => void>;
+}
+
+// cleanChunks[0] 固定为头部，其余为滚动尾部；总量始终 <= MAX_CAPTURED_BYTES。
+function appendBoundedCapture(record: ManagedTaskRecord, buf: Buffer): void {
+  if (buf.length === 0) return;
+  let head = record.cleanChunks[0] ?? Buffer.alloc(0);
+  const tail = record.cleanChunks.slice(1);
+  let rest = buf;
+
+  if (head.length < CAPTURE_HEAD_BYTES) {
+    const take = Math.min(CAPTURE_HEAD_BYTES - head.length, rest.length);
+    head = head.length === 0 ? Buffer.from(rest.subarray(0, take)) : Buffer.concat([head, rest.subarray(0, take)]);
+    rest = rest.subarray(take);
+  }
+
+  let tailBytes = tail.reduce((sum, part) => sum + part.length, 0);
+  const maxTail = MAX_CAPTURED_BYTES - CAPTURE_HEAD_BYTES;
+  if (rest.length >= maxTail) {
+    record.droppedBytes = (record.droppedBytes ?? 0) + tailBytes + rest.length - maxTail;
+    tail.length = 0;
+    tail.push(Buffer.from(rest.subarray(rest.length - maxTail)));
+    tailBytes = maxTail;
+  } else if (rest.length > 0) {
+    tail.push(Buffer.from(rest));
+    tailBytes += rest.length;
+    while (tailBytes > maxTail) {
+      const excess = tailBytes - maxTail;
+      const first = tail[0]!;
+      if (first.length <= excess) {
+        record.droppedBytes = (record.droppedBytes ?? 0) + first.length;
+        tail.shift();
+        tailBytes -= first.length;
+      } else {
+        record.droppedBytes = (record.droppedBytes ?? 0) + excess;
+        tail[0] = first.subarray(excess);
+        tailBytes -= excess;
+      }
+    }
+  }
+
+  record.cleanChunks = [head, ...tail];
+  record.cleanByteLength = head.length + tailBytes;
+}
+
+function getCapturedBytes(record: ManagedTaskRecord): Buffer {
+  return Buffer.concat(record.cleanChunks);
+}
+
+interface CappedFileState {
+  bytes: number;
+  truncated: boolean;
+}
+
+// 磁盘全量输出逐 chunk 追加，到达上限后停止写入。
+function appendCapped(filePath: string, buf: Buffer, state: CappedFileState): void {
+  if (state.truncated) return;
+  const room = MAX_OUTPUT_FILE_BYTES - state.bytes;
+  if (room <= 0) {
+    state.truncated = true;
+    return;
+  }
+  const part = buf.length > room ? buf.subarray(0, room) : buf;
+  try {
+    appendFileSync(filePath, part);
+  } catch {
+    // 忽略 teardown 后的磁盘错误
+    return;
+  }
+  state.bytes += part.length;
+  if (part.length < buf.length || state.bytes >= MAX_OUTPUT_FILE_BYTES) state.truncated = true;
 }
 
 export interface SessionTaskContext {
@@ -335,13 +444,19 @@ function buildCommandEnv(workspace: string): NodeJS.ProcessEnv {
   };
 }
 
-function formatCompletedCommandBody(exitCode: number, cleanOutput: string, includeTimestamps?: { created: string; completed: string }): string {
+function formatCompletedCommandBody(
+  exitCode: number,
+  cleanOutput: string,
+  includeTimestamps?: { created: string; completed: string },
+  droppedBytes = 0,
+): string {
+  const droppedPrefix = droppedBytes > 0 ? `<dropped ${droppedBytes} bytes>\n` : "";
   const header = includeTimestamps
     ? `Created At: ${includeTimestamps.created}\nCompleted At: ${includeTimestamps.completed}\n`
     : "";
   const payload =
     cleanOutput.length > 0 ? `Command output:\n${cleanOutput}` : "No output from the command.";
-  return `${header}Command exited with code ${exitCode}.\n\n${payload}`;
+  return `${droppedPrefix}${header}Command exited with code ${exitCode}.\n\n${payload}`;
 }
 
 export async function executeRunCommand(
@@ -373,8 +488,10 @@ export async function executeRunCommand(
     "output.txt",
   );
   mkdirSync(tasksDir, { recursive: true });
+  mkdirSync(join(stepOutputPath, ".."), { recursive: true });
   const logPath = join(tasksDir, `task-${stepIndex}.log`);
   writeFileSync(logPath, "");
+  writeFileSync(stepOutputPath, "");
 
   const createdLocal = formatAgyTimestamp();
   const startUtc = formatAgyUtcTimestamp();
@@ -419,8 +536,9 @@ export async function executeRunCommand(
     logPath,
     logUri: encodeFileUri(logPath),
     stepOutputPath,
-    cleanChunks: [],
+    cleanChunks: [Buffer.alloc(0)],
     cleanByteLength: 0,
+    droppedBytes: 0,
     proc,
     shellPid: pyBin ? undefined : proc.pid,
     backgrounded: false,
@@ -428,19 +546,36 @@ export async function executeRunCommand(
     waiters: new Set(),
   };
 
-  const onChunk = (chunk: Buffer) => {
-    const cleaned = stripAnsiAndDecode(chunk);
+  const logState: CappedFileState = { bytes: 0, truncated: false };
+  const outputState: CappedFileState = { bytes: 0, truncated: false };
+  let ansiCarry = "";
+  const utf8Decoder = new TextDecoder("utf-8", { fatal: false });
+  const ingest = (decoded: string, final = false) => {
+    let source = ansiCarry + decoded;
+    if (final) {
+      ansiCarry = "";
+    } else {
+      // 末尾不完整 ESC 序列留到下一 chunk；其余照旧剥离。
+      const completeEnd = lastCompleteAnsiEnd(source);
+      const tail = source.slice(completeEnd);
+      const escAt = tail.indexOf("\x1b");
+      if (escAt >= 0) {
+        ansiCarry = tail.slice(escAt);
+        source = source.slice(0, completeEnd + escAt);
+      } else {
+        ansiCarry = "";
+      }
+    }
+    const cleaned = source.replace(ANSI_ESCAPE_RE, "");
     if (cleaned.length === 0) return;
     const cleanBuf = Buffer.from(cleaned, "utf8");
-    record.cleanChunks.push(cleanBuf);
-    record.cleanByteLength += cleanBuf.length;
+    appendBoundedCapture(record, cleanBuf);
     record.lastProgressMs = Date.now();
-    try {
-      appendFileSync(logPath, cleanBuf);
-    } catch {
-      // ignore disk errors after teardown
-    }
+    appendCapped(logPath, cleanBuf, logState);
+    appendCapped(stepOutputPath, cleanBuf, outputState);
   };
+  const onChunk = (chunk: Buffer) => ingest(utf8Decoder.decode(chunk));
+  const flushAnsiCarry = () => ingest("", true);
 
   proc.stdout?.on("data", onChunk);
   proc.stderr?.on("data", onChunk);
@@ -470,6 +605,7 @@ export async function executeRunCommand(
 
   const exitPromise = new Promise<void>((resolveExit) => {
     proc.once("close", (code, signal) => {
+      flushAnsiCarry();
       if (record.killedByUser) {
         record.status = "CANCELED";
       } else if (
@@ -499,8 +635,8 @@ export async function executeRunCommand(
             delivered: false,
           });
         } else {
-          const cleanOut = Buffer.concat(record.cleanChunks).toString("utf8");
-          const rawBody = formatCompletedCommandBody(record.exitCode, cleanOut);
+          const cleanOut = getCapturedBytes(record).toString("utf8");
+          const rawBody = formatCompletedCommandBody(record.exitCode, cleanOut, undefined, record.droppedBytes ?? 0);
           const truncatedBody = truncateAndPersistOutput(rawBody, record.stepOutputPath);
           ctx.pushNotice({
             ts: tsUtc,
@@ -531,11 +667,11 @@ export async function executeRunCommand(
       return { text: "Tool execution was canceled", isError: true };
     }
     const completedLocal = formatAgyTimestamp();
-    const cleanOut = Buffer.concat(record.cleanChunks).toString("utf8");
+    const cleanOut = getCapturedBytes(record).toString("utf8");
     const fullFormatted = formatCompletedCommandBody(record.exitCode, cleanOut, {
       created: createdLocal,
       completed: completedLocal,
-    });
+    }, record.droppedBytes ?? 0);
     return {
       text: truncateAndPersistOutput(fullFormatted, record.stepOutputPath),
     };
@@ -545,7 +681,7 @@ export async function executeRunCommand(
   record.backgrounded = true;
   ctx.tasksByStep.set(stepIndex, record);
 
-  const currentCleanBytes = Buffer.concat(record.cleanChunks);
+  const currentCleanBytes = getCapturedBytes(record);
   const preview = buildTailLogPreview(currentCleanBytes);
   let out =
     `Tool is running as a background task with task id: ${record.taskId}\n` +
@@ -692,8 +828,8 @@ export async function executeManageTask(
     if (record.status === "DONE" && !record.fullResultDeliveredViaStatus) {
       record.fullResultDeliveredViaStatus = true;
       ctx.markNoticeDelivered(record.taskId);
-      const cleanOut = Buffer.concat(record.cleanChunks).toString("utf8");
-      const rawBody = formatCompletedCommandBody(record.exitCode, cleanOut);
+      const cleanOut = getCapturedBytes(record).toString("utf8");
+      const rawBody = formatCompletedCommandBody(record.exitCode, cleanOut, undefined, record.droppedBytes ?? 0);
       const truncatedBody = truncateAndPersistOutput(rawBody, record.stepOutputPath);
       return {
         text: `Task id "${record.taskId}" finished with result:\n${truncatedBody}\nLog: ${record.logUri}`,
@@ -702,7 +838,7 @@ export async function executeManageTask(
     }
 
     const completed = formatAgyTimestamp();
-    const cleanBytes = Buffer.concat(record.cleanChunks);
+    const cleanBytes = getCapturedBytes(record);
     const preview = buildTailLogPreview(cleanBytes);
     let out =
       `Created At: ${created}\nCompleted At: ${completed}\n` +
