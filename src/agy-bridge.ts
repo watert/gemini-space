@@ -1,10 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import {
   executeManageTask,
   executeRunCommand,
   killAllSessionTasks,
+  readTaskSidecars,
   type ManagedTaskRecord,
   type SessionNoticeItem,
   type SessionTaskContext,
@@ -51,8 +52,18 @@ export interface BridgeToolCallResult {
   isError?: boolean;
 }
 
+// stdio 客户端可能每轮对话重启服务子进程；固定派生 sessionUuid 让 TaskId 与
+// 任务目录跨进程可复现，否则内存态一丢就查不到上一轮的任务。
+const STDIO_MCP_SESSION_ID = "stdio-single-process";
+
+function deriveSessionUuid(mcpSessionId: string): string {
+  if (mcpSessionId !== STDIO_MCP_SESSION_ID) return randomUUID();
+  const hex = createHash("sha1").update(`gemini-space:${mcpSessionId}`).digest("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
 class McpSessionEntry implements SessionTaskContext {
-  readonly sessionUuid = randomUUID();
+  readonly sessionUuid: string;
   lastUsedAt = Date.now();
   private stepCounter = -2;
   readonly tasksByStep = new Map<number, ManagedTaskRecord>();
@@ -62,7 +73,16 @@ class McpSessionEntry implements SessionTaskContext {
     readonly mcpSessionId: string,
     readonly stateRoot: string,
     readonly workspace: string,
-  ) {}
+  ) {
+    this.sessionUuid = deriveSessionUuid(mcpSessionId);
+    // 从磁盘恢复 stepCounter：stdio 进程每轮重启，若从 -2 重新开始会覆盖上一轮同名任务。
+    try {
+      const existing = readTaskSidecars(this);
+      if (existing.length > 0) this.stepCounter = existing[existing.length - 1]!.stepIndex;
+    } catch {
+      // 恢复失败时退回默认计数，最多覆盖同 stepIndex 的历史 sidecar。
+    }
+  }
 
   nextStepIndex(): number {
     this.stepCounter += 4;

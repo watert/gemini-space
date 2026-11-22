@@ -1,5 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -624,6 +624,7 @@ export async function executeRunCommand(
       } else if (signal) {
         record.exitCode = 128;
       }
+      persistTaskSidecar(record);
 
       if (record.backgrounded) {
         const tsUtc = formatAgyUtcTimestamp();
@@ -680,6 +681,7 @@ export async function executeRunCommand(
   // Transition to background task
   record.backgrounded = true;
   ctx.tasksByStep.set(stepIndex, record);
+  persistTaskSidecar(record);
 
   const currentCleanBytes = getCapturedBytes(record);
   const preview = buildTailLogPreview(currentCleanBytes);
@@ -767,6 +769,93 @@ function waitOnTaskRecord(record: ManagedTaskRecord, timeoutMs: number): Promise
   });
 }
 
+// ── 任务元数据 sidecar ────────────────────────────────────────────
+// stdio 客户端可能每轮对话重启服务子进程，内存态 tasksByStep 会随之丢失。
+// 每个任务在日志旁写一份 <task-N>.json，新进程据此回答「上一轮的任务现在怎样了」。
+export interface TaskSidecar {
+  taskId: string;
+  stepIndex: number;
+  commandLine: string;
+  toolSummary: string;
+  isDaemon: boolean;
+  startTimeIsoUtc: string;
+  status: TaskStatusEnum;
+  exitCode: number;
+  shellPid?: number;
+  logPath: string;
+  logUri: string;
+}
+
+function sidecarPathOf(logPath: string): string {
+  return logPath.endsWith(".log") ? `${logPath.slice(0, -4)}.json` : `${logPath}.json`;
+}
+
+// 原子写：先写 .tmp 再 rename，避免服务进程被强杀时留下半截 JSON。
+function persistTaskSidecar(record: ManagedTaskRecord): void {
+  const target = sidecarPathOf(record.logPath);
+  const payload: TaskSidecar = {
+    taskId: record.taskId,
+    stepIndex: record.stepIndex,
+    commandLine: record.commandLine,
+    toolSummary: record.toolSummary,
+    isDaemon: record.isDaemon,
+    startTimeIsoUtc: record.startTimeIsoUtc,
+    status: record.status,
+    exitCode: record.exitCode,
+    ...(record.shellPid ? { shellPid: record.shellPid } : {}),
+    logPath: record.logPath,
+    logUri: record.logUri,
+  };
+  try {
+    const tmp = `${target}.tmp`;
+    writeFileSync(tmp, JSON.stringify(payload));
+    renameSync(tmp, target);
+  } catch {
+    // 落盘失败不影响任务主流程，只是失去跨进程查询能力。
+  }
+}
+
+function tasksDirOf(ctx: SessionTaskContext): string {
+  return join(ctx.stateRoot, "brain", ctx.sessionUuid, ".system_generated", "tasks");
+}
+
+// 读取上一进程留下的任务元数据；损坏或半截文件直接忽略。
+export function readTaskSidecars(ctx: SessionTaskContext): TaskSidecar[] {
+  const dir = tasksDirOf(ctx);
+  if (!existsSync(dir)) return [];
+  const out: TaskSidecar[] = [];
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      out.push(JSON.parse(readFileSync(join(dir, name), "utf8")) as TaskSidecar);
+    } catch {
+      // 忽略损坏的 sidecar。
+    }
+  }
+  return out.sort((a, b) => a.stepIndex - b.stepIndex);
+}
+
+function isPidAlive(pid?: number): boolean {
+  if (!pid || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readLogTailText(logPath: string, maxChars = TAIL_PREVIEW_BYTES * 2): string {
+  try {
+    const size = statSync(logPath).size;
+    const buf = readFileSync(logPath);
+    const start = Math.max(0, size - maxChars * 4);
+    return stripAnsiAndDecode(buf.subarray(start)).slice(-maxChars);
+  } catch {
+    return "";
+  }
+}
+
 export async function executeManageTask(
   ctx: SessionTaskContext,
   args: Record<string, unknown>,
@@ -774,30 +863,46 @@ export async function executeManageTask(
 ): Promise<{ text: string; suppressNoticeTaskId?: string }> {
   const action = String(args.Action ?? "");
   const created = formatAgyTimestamp();
+  // 上一进程留下的 task 元数据；内存里没有的才当作 orphan。
+  const orphanSidecars = readTaskSidecars(ctx).filter((s) => !ctx.tasksByStep.has(s.stepIndex));
 
   if (action === "list") {
     const running = [...ctx.tasksByStep.values()]
       .filter((t) => t.status === "RUNNING")
       .sort((a, b) => a.stepIndex - b.stepIndex);
+    // 跨进程存活的任务：只有 pid 还活着才算 RUNNING。
+    const ghostRunning = orphanSidecars.filter((s) => isPidAlive(s.shellPid));
     const completed = formatAgyTimestamp();
-    if (running.length === 0) {
+    if (running.length === 0 && ghostRunning.length === 0) {
       return {
         text: `Created At: ${created}\nCompleted At: ${completed}\nNo background tasks are currently running.`,
       };
     }
-    const items = running.map((t) => ({
-      taskId: t.taskId,
-      toolName: "run_command",
-      toolSummary: t.toolSummary,
-      description: t.commandLine,
-      startTime: t.startTimeIsoUtc,
-      logUri: t.logUri,
-      ...(t.isDaemon ? { isDaemon: true } : {}),
-    }));
+    const items = [
+      ...running.map((t) => ({
+        taskId: t.taskId,
+        toolName: "run_command",
+        toolSummary: t.toolSummary,
+        description: t.commandLine,
+        startTime: t.startTimeIsoUtc,
+        logUri: t.logUri,
+        ...(t.isDaemon ? { isDaemon: true } : {}),
+      })),
+      ...ghostRunning.map((s) => ({
+        taskId: s.taskId,
+        toolName: "run_command",
+        toolSummary: s.toolSummary,
+        description: s.commandLine,
+        startTime: s.startTimeIsoUtc,
+        logUri: s.logUri,
+        ...(s.isDaemon ? { isDaemon: true } : {}),
+        restoredFromDisk: true,
+      })),
+    ];
     return {
       text:
         `Created At: ${created}\nCompleted At: ${completed}\n` +
-        `You have ${running.length} background task(s) currently running:\n` +
+        `You have ${items.length} background task(s) currently running:\n` +
         JSON.stringify(items),
     };
   }
@@ -809,6 +914,23 @@ export async function executeManageTask(
 
   if (action === "status") {
     if (!record) {
+      // 进程重启后的任务：从 sidecar + 日志尾部还原状态。
+      const ghost = orphanSidecars.find((s) => s.stepIndex === stepIndex);
+      if (ghost) {
+        const alive = isPidAlive(ghost.shellPid);
+        const completed = formatAgyTimestamp();
+        const tail = readLogTailText(ghost.logPath);
+        let out =
+          `Created At: ${created}\nCompleted At: ${completed}\n` +
+          `Task: ${ghost.taskId}\n` +
+          `Status: ${alive ? "RUNNING" : "EXITED (process no longer alive)"}\n` +
+          `Log: ${ghost.logUri}\n`;
+        if (tail.length > 0) out += `Log output:\n${tail}\n`;
+        out += alive
+          ? `\n[stdio server was restarted; task restored from disk. send_input is unavailable, kill still works.]`
+          : `\n[stdio server was restarted; exit code: ${ghost.exitCode}]`;
+        return { text: out, suppressNoticeTaskId: ghost.taskId };
+      }
       if (stepIndex < 0 || stepIndex > totalSteps) {
         throw new AgyToolExecutionError(
           `task "${resolvedId}" refers to a non-existent step index ${stepIndex} (total steps: ${totalSteps})`,
@@ -862,6 +984,12 @@ export async function executeManageTask(
       throw new AgyToolExecutionError('Input is required for the "send_input" action');
     }
     if (!record) {
+      const ghost = orphanSidecars.find((s) => s.stepIndex === stepIndex);
+      if (ghost) {
+        throw new AgyToolExecutionError(
+          `cannot send_input task "${ghost.taskId}": process was detached when the stdio server restarted; stdin is not available`,
+        );
+      }
       throw new AgyToolExecutionError(
         `task "${resolvedId}" refers to a non-existent step index ${stepIndex} (total steps: ${totalSteps})`,
       );
@@ -883,6 +1011,33 @@ export async function executeManageTask(
 
   if (action === "kill") {
     if (!record) {
+      // 进程重启后的任务：按 pid 直接杀，并更新 sidecar 状态。
+      const ghost = orphanSidecars.find((s) => s.stepIndex === stepIndex);
+      if (ghost && isPidAlive(ghost.shellPid)) {
+        const pid = ghost.shellPid!;
+        let killed = false;
+        for (const target of [-pid, pid]) {
+          try {
+            process.kill(target, "SIGKILL");
+            killed = true;
+          } catch {
+            // 尝试下一个目标（进程组 → 单进程）。
+          }
+        }
+        if (!killed) {
+          throw new AgyToolExecutionError(`cannot kill task "${ghost.taskId}": failed to signal pid ${pid}`);
+        }
+        try {
+          writeFileSync(sidecarPathOf(ghost.logPath), JSON.stringify({ ...ghost, status: "CANCELED", exitCode: 137 }));
+        } catch {
+          // sidecar 更新失败不影响杀进程。
+        }
+        const completed = formatAgyTimestamp();
+        return {
+          text: `Created At: ${created}\nCompleted At: ${completed}\nTask "${ghost.taskId}" cancelled (restored from disk).`,
+          suppressNoticeTaskId: ghost.taskId,
+        };
+      }
       throw new AgyToolExecutionError(
         `task "${resolvedId}" refers to a non-existent step index ${stepIndex} (total steps: ${totalSteps})`,
       );
@@ -896,6 +1051,7 @@ export async function executeManageTask(
     killProcessTreeHard(record.shellPid, record.proc);
     await waitOnTaskRecord(record, 1_500);
     record.status = "CANCELED";
+    persistTaskSidecar(record);
     const completed = formatAgyTimestamp();
     return {
       text: `Created At: ${created}\nCompleted At: ${completed}\nTask "${record.taskId}" cancelled.`,
