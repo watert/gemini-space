@@ -422,7 +422,8 @@ export interface SessionTaskContext {
   readonly stateRoot: string;
   readonly workspace: string;
   nextStepIndex(): number;
-  currentStepCount(): number;
+  // 当前 step 序号 (-2 起、每次工具调用 +4), 仅用于 TaskId 步号校验
+  currentStepIndex(): number;
   readonly tasksByStep: Map<number, ManagedTaskRecord>;
   pushNotice(notice: SessionNoticeItem): void;
   markNoticeDelivered(sender: string): void;
@@ -909,7 +910,7 @@ export async function executeManageTask(
 
   const rawTaskId = typeof args.TaskId === "string" ? args.TaskId : "";
   const { resolvedId, stepIndex } = parseTaskIdForSession(rawTaskId, ctx);
-  const totalSteps = ctx.currentStepCount();
+  const totalSteps = ctx.currentStepIndex();
   const record = ctx.tasksByStep.get(stepIndex);
 
   if (action === "status") {

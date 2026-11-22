@@ -113,7 +113,7 @@ test(
         wireProtocol: "genai",
         holdMs: 5_500,
         callTimeoutMs: 25_000,
-        maxTurnsPerSession: 80,
+        warnToolCallsPerSession: 0,
         sessionIdleTtlMs: 600_000,
         exposedTools: ["read_file", "write_file", "edit_file", "run_command", "manage_task"],
       },
@@ -450,7 +450,7 @@ test("deterministic agy 1.5.10 parity contracts: validation, read_file paginatio
       wireProtocol: "genai",
       holdMs: 2_500,
       callTimeoutMs: 10_000,
-      maxTurnsPerSession: 80,
+      warnToolCallsPerSession: 0,
       sessionIdleTtlMs: 600_000,
       exposedTools: ["read_file", "write_file", "edit_file", "run_command", "manage_task"],
     },
@@ -649,4 +649,51 @@ test("deterministic agy 1.5.10 parity contracts: validation, read_file paginatio
   });
   assert.equal(killAgain.isError, true);
   assert.match((killAgain.content[0] as { text: string }).text, /task is not running \(status: CANCELED\)/);
+});
+
+test("warnToolCallsPerSession 只软提醒不拦截: 长会话可以一直跑下去", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-turn-budget-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const workspace = join(root, "ws");
+  await mkdir(workspace, { recursive: true });
+  const workspaceFile = join(workspace, "note.txt");
+  await writeFile(workspaceFile, "hello\n");
+
+  const bridge = new AgyBridge(
+    {
+      bin: "/nonexistent/agy",
+      workspace,
+      agyHome: join(root, "state"),
+      modelId: "unused",
+      wireProtocol: "genai",
+      holdMs: 1_000,
+      callTimeoutMs: 10_000,
+      warnToolCallsPerSession: 3,
+      sessionIdleTtlMs: 600_000,
+      exposedTools: ["read_file", "write_file", "edit_file", "run_command", "manage_task"],
+    },
+    {
+      level: "error",
+      format: "json",
+      requests: false,
+      assets: false,
+      toolCalls: false,
+      shellCommands: false,
+      trustProxy: false,
+    },
+  );
+  await bridge.start();
+  t.after(() => bridge.close());
+
+  // 7 次调用跨过两个提醒档位 (3, 6); 计数在本次调用前结算, 故提醒落在第 4 / 7 次
+  const texts: string[] = [];
+  for (let i = 0; i < 7; i += 1) {
+    const res = await bridge.callTool("warn-session", "read_file", { Path: workspaceFile });
+    assert.notEqual(res.isError, true, `第 ${i + 1} 次调用不该被硬拦`);
+    texts.push((res.content[0] as { text: string }).text);
+  }
+
+  assert.equal(texts.filter((txt) => txt.includes("次工具调用")).length, 2, "每个档位只提醒一次");
+  assert.match(texts[3]!, /此前已累计 3 次工具调用/);
+  assert.match(texts[6]!, /此前已累计 6 次工具调用/);
 });

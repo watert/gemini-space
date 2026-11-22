@@ -39,6 +39,8 @@ Most local coding MCP servers (`Desktop Commander`, `DevSpace`, `Filesystem MCP`
   - Issues soft `Mcp-Session-Id` headers on `initialize` (`1 Gemini Subagent ↔ 1 isolated task/notice queue`), executes commands across subagents truly in parallel, and never `404`s stale sessions across local server restarts.
 - **Code Mode (`execute` / `poll_execution` / `cancel_execution`)**
   - Run an async JavaScript snippet on your machine calling `tools.read_file`, `tools.edit_file`, `tools.run_command` in loops or `Promise.all`—collapsing 20+ operations into a **single Gemini tool call**.
+- **Session Call Budget Warns, Never Blocks**
+  - Every `warnToolCallsPerSession` calls (default 200, `0` disables) the tool result gets one extra line suggesting a fresh conversation. Long sessions keep running—resource bounds are the concurrent-session cap, task/notice caps, and per-call timeouts, not a turn counter.
 - **Automatic Local Skills Injection**
   - Scans `~/.agents/skills`, `~/.claude/skills`, `~/.codex/skills`, and `~/.devspace/skills` (`SKILL.md`) into MCP `instructions` (injected directly into Gemini Web's system prompt).
 - **OAuth 2.1 + `/web/` Activity Dashboard**

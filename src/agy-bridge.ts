@@ -20,6 +20,7 @@ import {
   AGY_BUILTIN_DECLARATIONS,
   AgyToolExecutionError,
   AgyToolValidationError,
+  formatAgyTimestamp,
   validateAgyToolArgs,
   type AgyFunctionDeclaration,
 } from "./agy-tool-schemas.js";
@@ -66,6 +67,8 @@ class McpSessionEntry implements SessionTaskContext {
   readonly sessionUuid: string;
   lastUsedAt = Date.now();
   private stepCounter = -2;
+  /** 最近一次已发出调用量提醒的计数，避免同一档位重复刷屏。 */
+  private warnedCallCount = 0;
   readonly tasksByStep = new Map<number, ManagedTaskRecord>();
   readonly notices: SessionNoticeItem[] = [];
 
@@ -89,8 +92,23 @@ class McpSessionEntry implements SessionTaskContext {
     return this.stepCounter;
   }
 
-  currentStepCount(): number {
-    return Math.max(1, this.stepCounter + 2);
+  /** 当前 step 序号 (-2 起、每次调用 +4)，仅供 TaskId 步号校验。 */
+  currentStepIndex(): number {
+    return this.stepCounter;
+  }
+
+  /** 本会话累计工具调用次数：由 stepCounter 反算，跨进程可从 sidecar 步号恢复。 */
+  currentToolCallCount(): number {
+    return Math.max(0, Math.round((this.stepCounter + 2) / 4));
+  }
+
+  /** 是否该发一次调用量提醒：跨过一个阈值后记账，同档位不重发。 */
+  shouldWarnToolCalls(warnAt: number): boolean {
+    if (warnAt <= 0) return false;
+    const calls = this.currentToolCallCount();
+    if (calls < this.warnedCallCount + warnAt) return false;
+    this.warnedCallCount = calls;
+    return true;
   }
 
   hasRunningTasks(): boolean {
@@ -144,6 +162,7 @@ export function buildServerInstructions(
 ): string {
   const holdSeconds = Math.round(holdMs / 1000);
   const parts = [
+    "agy 风格的本地操作。如果默认的读写没有权限,可以尝试用这边的工具;如果用户没有提及目录,默认工作空间为 ~/docs/。",
     "These tools run directly on the owner's Mac with full local filesystem and zsh permissions, matching Antigravity (agy) tool semantics.",
     "Always pass absolute file paths to read_file, write_file, and edit_file; no workspace-open step is needed.",
     "Before making changes in an unfamiliar repository, check whether AGENTS.md or CLAUDE.md exists at its root with read_file and follow its rules.",
@@ -254,12 +273,23 @@ export class AgyBridge {
     const args = rawArgs ?? {};
     const targetEntry = this.resolveTargetSession(mcpSessionId, name, args);
     targetEntry.lastUsedAt = Date.now();
-    const turnLimit = this.config.maxTurnsPerSession;
-    if (targetEntry.currentStepCount() > turnLimit) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: `session turn limit (${turnLimit}) reached; start a new session` }],
-      };
+    // 调用量只做软提醒：服务端真正的资源边界是并发会话数 / 任务数 / 单次调用超时。
+    // stdio 客户端共用一个固定会话 UUID，历史账本会跨对话累积，硬拦只会误伤长任务。
+    if (targetEntry.shouldWarnToolCalls(this.config.warnToolCallsPerSession)) {
+      const calls = targetEntry.currentToolCallCount();
+      targetEntry.pushNotice({
+        sender: "agy-bridge",
+        ts: formatAgyTimestamp(),
+        delivered: false,
+        text:
+          `本会话此前已累计 ${calls} 次工具调用。若是长任务可继续; 若上下文已经很长,` +
+          `新开一个对话会更稳 (计数跨轮恢复, 不代表任何资源上限)。`,
+      });
+      logEvent(this.logging, "warn", "session_tool_call_warning", {
+        calls,
+        warnAt: this.config.warnToolCallsPerSession,
+        agySessionId: targetEntry.sessionUuid.slice(0, 12),
+      });
     }
     const callStart = Date.now();
 

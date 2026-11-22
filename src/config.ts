@@ -14,7 +14,7 @@ export interface AgyBridgeConfig {
   wireProtocol: "genai" | "openai";
   holdMs: number;
   callTimeoutMs: number;
-  maxTurnsPerSession: number;
+  warnToolCallsPerSession: number;
   sessionIdleTtlMs: number;
   exposedTools: string[];
 }
@@ -102,7 +102,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       wireProtocol: stored.agy.wireProtocol,
       holdMs: stored.agy.holdMs,
       callTimeoutMs: stored.agy.callTimeoutMs,
-      maxTurnsPerSession: stored.agy.maxTurnsPerSession,
+      warnToolCallsPerSession: stored.agy.warnToolCallsPerSession,
       sessionIdleTtlMs: stored.agy.sessionIdleTtlMs,
       exposedTools: env.DEVSPACE_AGY_TOOLS
         ? env.DEVSPACE_AGY_TOOLS.split(",").map((s) => s.trim()).filter(Boolean)

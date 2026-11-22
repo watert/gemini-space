@@ -39,6 +39,8 @@
   - `initialize` 握手签发软会话头 `Mcp-Session-Id`（**1 个 Gemini Subagent ↔ 1 个独立后台任务与通知队列**），跨子代理真并行执行互不阻塞；且本地服务重启后收到旧会话头会自动平滑接管，绝不报 `404 Session not found`。
 - **Code Mode 批处理引擎（`execute` / `poll_execution` / `cancel_execution`）**
   - 允许 Gemini 在单次工具调用里提交一段异步 JS 脚本，在本地循环或并发调用 `tools.read_file`、`tools.edit_file`、`tools.run_command` 再汇总返回——把 20 次工具往返压缩成 **1 次**，彻底绕开网页端单轮工具调用次数上限。
+- **会话调用量只提醒，不硬拦**
+  - 累计工具调用数每达到 `warnToolCallsPerSession`（默认 200，设 `0` 关闭）的整数倍，会在工具结果尾部追加一次「可开新对话」的提醒；长会话继续跑得下去。资源边界交给并发会话数、任务/通知上限与单次调用超时来守，不再用轮次计数误伤长任务。
 - **本机 Skills 自动扫描注入**
   - 启动时自动扫描 `~/.agents/skills`、`~/.claude/skills`、`~/.codex/skills`、`~/.devspace/skills` 下的 `SKILL.md`，拼入 MCP `instructions`（Google 文档确认会直接注入 Gemini 的 System Prompt），模型按需直接 `read_file` 读取。
 - **自托管 OAuth 2.1 + `/web/` 审计面板**

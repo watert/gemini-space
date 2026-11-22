@@ -33,7 +33,9 @@ const agyConfigSchema = z.object({
   wireProtocol: z.enum(["genai", "openai"]).default("genai"),
   holdMs: z.number().int().min(1_000).max(58_000).default(12_000),
   callTimeoutMs: z.number().int().min(5_000).max(120_000).default(50_000),
-  maxTurnsPerSession: z.number().int().min(5).max(1_000).default(80),
+  // 软提醒阈值: 累计工具调用数每达到该值的整数倍, 就在工具结果尾部追加一次劝退提醒;
+  // 设为 0 关闭。不再硬拦 —— 资源边界由并发会话数 / 任务数 / 单次调用超时来守。
+  warnToolCallsPerSession: z.number().int().min(0).max(100_000).default(200),
   sessionIdleTtlMs: z.number().int().min(60_000).max(24 * 60 * 60_000).default(30 * 60_000),
   exposedTools: z.array(z.string().trim().min(1)).min(1).default([...DEFAULT_AGY_EXPOSED_TOOLS]),
 }).passthrough().prefault({});
