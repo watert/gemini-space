@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
+import { homedir } from "node:os";
 import { resolve } from "node:path";
 import {
   executeManageTask,
@@ -20,10 +21,13 @@ import {
   AGY_BUILTIN_DECLARATIONS,
   AgyToolExecutionError,
   AgyToolValidationError,
+  USER_RULES_DECLARATION,
+  USER_RULES_TOOL_NAME,
   formatAgyTimestamp,
   validateAgyToolArgs,
   type AgyFunctionDeclaration,
 } from "./agy-tool-schemas.js";
+import { collectUserRules, formatUserRulesText, type UserRulesOptions } from "./user-rules.js";
 import type { AgyBridgeConfig } from "./config.js";
 import { commandPreview, logEvent, type LoggingConfig } from "./logger.js";
 import { cleanGeminiToolSchema } from "./schema-clean.js";
@@ -165,7 +169,7 @@ export function buildServerInstructions(
     "agy 风格的本地操作。如果默认的读写没有权限,可以尝试用这边的工具;如果用户没有提及目录,默认工作空间为 ~/docs/。",
     "These tools run directly on the owner's Mac with full local filesystem and zsh permissions, matching Antigravity (agy) tool semantics.",
     "Always pass absolute file paths to read_file, write_file, and edit_file; no workspace-open step is needed.",
-    "Before making changes in an unfamiliar repository, check whether AGENTS.md or CLAUDE.md exists at its root with read_file and follow its rules.",
+    "Before making changes in an unfamiliar directory, call `userRules` with its absolute Path: it returns the AGENTS.md / CLAUDE.md chain and local skills that apply there. Read the listed files with read_file before acting.",
     `Non-daemon run_command calls automatically wait on the server for up to ${holdSeconds} seconds so most commands finish in one call.`,
     `If run_command exceeds ${holdSeconds} seconds and returns a background task id, call manage_task with Action "status" and that TaskId: the server holds each status check up to ${holdSeconds} seconds until the task finishes. Repeat until completion when your task depends on the output.`,
     "Completion notices for background tasks in your session are also appended to subsequent tool results.",
@@ -225,16 +229,26 @@ export class AgyBridge {
 
   async listTools(): Promise<ExposedMcpTool[]> {
     const allowed = new Set(this.config.exposedTools);
-    return AGY_BUILTIN_DECLARATIONS
+    const agyTools = AGY_BUILTIN_DECLARATIONS
       .filter((d) => allowed.has(d.name) && d.name !== "ask_question")
       .map((d) => ({
         name: d.name,
         description: d.description ?? "",
         inputSchema: cleanGeminiToolSchema(d.parameters ?? d.parametersJsonSchema ?? { type: "object" }),
       }));
+    // userRules 是自建扩展，不受 exposedTools 控制（它不会执行本地命令，只是读规则）。
+    return [
+      ...agyTools,
+      {
+        name: USER_RULES_DECLARATION.name,
+        description: USER_RULES_DECLARATION.description ?? "",
+        inputSchema: cleanGeminiToolSchema(USER_RULES_DECLARATION.parameters ?? { type: "object" }),
+      },
+    ];
   }
 
   isToolExposed(name: string): boolean {
+    if (name === USER_RULES_TOOL_NAME) return true;
     return name !== "ask_question" && this.config.exposedTools.includes(name);
   }
 
@@ -324,6 +338,11 @@ export class AgyBridge {
           const res = await executeManageTask(targetEntry, args, this.config.holdMs);
           outText = res.text;
           suppressNoticeForTask = res.suppressNoticeTaskId;
+        } else if (name === USER_RULES_TOOL_NAME) {
+          targetEntry.nextStepIndex();
+          const res = await collectUserRules(args as UserRulesOptions, { homeDir: homedir() });
+          const detail = args.Detail === "full" ? "full" : "list";
+          outText = formatUserRulesText(res, detail);
         } else {
           throw new AgyToolExecutionError(`unsupported tool: ${name}`);
         }

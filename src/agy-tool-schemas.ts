@@ -311,3 +311,45 @@ export function validateAgyToolArgs(
     throw new AgyToolValidationError(bullets);
   }
 }
+
+/**
+ * 自建扩展工具（非 agy 原生）：按路径拉取适用的 AGENTS.md / CLAUDE.md 与 skills。
+ * pull 模型 —— 只在被调用时读取，不塞进启动期 instructions。
+ */
+export const USER_RULES_TOOL_NAME = "userRules";
+
+export const USER_RULES_DECLARATION: AgyFunctionDeclaration = {
+  name: USER_RULES_TOOL_NAME,
+  description:
+    "List the AGENTS.md / CLAUDE.md rule files and local skills that apply to a path, walking up from it to the home directory. Call this before writing files or running commands in an unfamiliar directory, then read the listed files with read_file when you need their full text.",
+  parameters: {
+    type: "OBJECT",
+    properties: {
+      Path: {
+        type: "STRING",
+        description:
+          "Absolute path of the file or directory to inspect. Omit to get user-level rules only.",
+      },
+      Scope: {
+        type: "STRING",
+        enum: ["auto", "user", "project", "all"],
+        description:
+          "auto (default) keeps the whole walk-up chain; user limits to home-level rules; project drops home-level ones; all is the same as auto.",
+      },
+      IncludeSkills: {
+        type: "BOOLEAN",
+        description: "Include SKILL.md entries found in .agents/skills and .claude/skills (default true).",
+      },
+      Detail: {
+        type: "STRING",
+        enum: ["list", "full"],
+        description:
+          "list (default) returns names and truncated descriptions; full also inlines the rule file contents.",
+      },
+      Query: {
+        type: "STRING",
+        description: "Optional keywords; matching skills are ranked first.",
+      },
+    },
+  },
+};
