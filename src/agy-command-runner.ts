@@ -593,6 +593,9 @@ export async function executeRunCommand(
           const parsedPid = Number(line.slice(4));
           if (Number.isInteger(parsedPid) && parsedPid > 0) {
             record.shellPid = parsedPid;
+            // shellPid 来自 control fd，是异步到达的；创建时的 sidecar 还没有它，
+            // 跨进程判活会误判为已退出，所以拿到后立刻补写一次。
+            persistTaskSidecar(record);
           }
         } else if (line.startsWith("SIG:")) {
           const sigNum = Number(line.slice(4));

@@ -15,7 +15,8 @@
   "bin": {
     "gemini-space": "bin/gemini-space.js",
     "devspace": "bin/devspace.js",
-    "gemini-space-stdio": "bin/gemini-space-stdio.js"
+    "gemini-space-stdio": "bin/gemini-space-stdio.js",
+    "gemini-space-call": "bin/gemini-space-call.js"
   },
   "files": [
     "bin",

@@ -210,6 +210,27 @@ gemini-space config show                  # Print resolved configuration
 gemini-space config set codeMode.enabled false
 ```
 
+### Calling tools straight from a shell
+
+`gemini-space-call` spawns the stdio server, runs one MCP tool, prints the result,
+and exits. No Gemini app, no HTTP, no browser — useful for verifying behaviour or
+scripting on top of the same tool surface the model sees.
+
+```bash
+gemini-space-call tools                                  # list exposed tools
+gemini-space-call read_file '{"Path":"/etc/hosts","StartLine":1,"EndLine":5}'
+gemini-space-call run_command '{"CommandLine":"ls ~/docs | head","toolSummary":"list docs","WaitMsBeforeAsync":5000}'
+gemini-space-call user_rules '{"Path":"~/docs","Query":"naming"}'
+echo '{"CommandLine":"echo hi","toolSummary":"echo","WaitMsBeforeAsync":5000}' | gemini-space-call run_command -
+```
+
+Options: `--json` (raw MCP result), `--timeout <ms>`, `--workspace <dir>`, and
+`--detach` — the last one kills the server right after the call so a daemon task
+survives, letting a second `gemini-space-call manage_task '{"Action":"list"}'`
+observe it across processes.
+
+Exit code is `1` when the tool returns `isError`, so it composes in scripts.
+
 ---
 
 ## Acknowledgements & License

@@ -169,7 +169,7 @@ export function buildServerInstructions(
     "agy 风格的本地操作。如果默认的读写没有权限,可以尝试用这边的工具;如果用户没有提及目录,默认工作空间为 ~/docs/。",
     "These tools run directly on the owner's Mac with full local filesystem and zsh permissions, matching Antigravity (agy) tool semantics.",
     "Always pass absolute file paths to read_file, write_file, and edit_file; no workspace-open step is needed.",
-    "Before making changes in an unfamiliar directory, call `userRules` with its absolute Path: it returns the AGENTS.md / CLAUDE.md chain and local skills that apply there. Read the listed files with read_file before acting.",
+    "Before making changes in an unfamiliar directory, call `user_rules` with its absolute Path: it returns the AGENTS.md / CLAUDE.md chain and local skills that apply there. Read the listed files with read_file before acting.",
     `Non-daemon run_command calls automatically wait on the server for up to ${holdSeconds} seconds so most commands finish in one call.`,
     `If run_command exceeds ${holdSeconds} seconds and returns a background task id, call manage_task with Action "status" and that TaskId: the server holds each status check up to ${holdSeconds} seconds until the task finishes. Repeat until completion when your task depends on the output.`,
     "Completion notices for background tasks in your session are also appended to subsequent tool results.",
@@ -236,7 +236,7 @@ export class AgyBridge {
         description: d.description ?? "",
         inputSchema: cleanGeminiToolSchema(d.parameters ?? d.parametersJsonSchema ?? { type: "object" }),
       }));
-    // userRules 是自建扩展，不受 exposedTools 控制（它不会执行本地命令，只是读规则）。
+    // user_rules 是自建扩展，不受 exposedTools 控制（它不会执行本地命令，只是读规则）。
     return [
       ...agyTools,
       {

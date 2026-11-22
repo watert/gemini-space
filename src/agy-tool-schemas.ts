@@ -316,7 +316,7 @@ export function validateAgyToolArgs(
  * 自建扩展工具（非 agy 原生）：按路径拉取适用的 AGENTS.md / CLAUDE.md 与 skills。
  * pull 模型 —— 只在被调用时读取，不塞进启动期 instructions。
  */
-export const USER_RULES_TOOL_NAME = "userRules";
+export const USER_RULES_TOOL_NAME = "user_rules";
 
 export const USER_RULES_DECLARATION: AgyFunctionDeclaration = {
   name: USER_RULES_TOOL_NAME,
