@@ -224,8 +224,8 @@ gemini-space-call user_rules '{"Path":"~/docs","Query":"naming"}'
 echo '{"CommandLine":"echo hi","toolSummary":"echo","WaitMsBeforeAsync":5000}' | gemini-space-call run_command -
 ```
 
-Options: `--json` (raw MCP result), `--timeout <ms>`, `--workspace <dir>`, and
-`--detach` — the last one kills the server right after the call so a daemon task
+Options: `--json` (raw MCP result), `--timeout <ms>`, `--workspace <dir>`,
+`--verbose` (server logs to stderr; silent by default), and `--detach` — the last one kills the server right after the call so a daemon task
 survives, letting a second `gemini-space-call manage_task '{"Action":"list"}'`
 observe it across processes.
 

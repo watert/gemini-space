@@ -8,7 +8,8 @@
  *   gemini-space-call user_rules '{"Path":"/Users/waterwu/docs"}'
  *
  * 选项：--json 输出原始 MCP 结果；--timeout <ms> 单次调用超时；--workspace <dir> 覆盖工作目录；
- *      --detach 调用后强杀服务进程，让后台任务存活（用于验证 manage_task 跨进程）。
+ *      --detach 调用后强杀服务进程，让后台任务存活（用于验证 manage_task 跨进程）；
+ *      --verbose 把服务端日志（stderr）透到终端，默认静默。
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -16,7 +17,7 @@ import { fileURLToPath } from "node:url";
 
 const USAGE = `用法:
   gemini-space-call tools [--json]
-  gemini-space-call [call] <tool> [<json-args>|'-'] [--json] [--detach] [--timeout <ms>] [--workspace <dir>]
+  gemini-space-call [call] <tool> [<json-args>|'-'] [--json] [--detach] [--verbose] [--timeout <ms>] [--workspace <dir>]
 
 示例:
   gemini-space-call tools
@@ -32,6 +33,7 @@ interface Parsed {
   rawArgs: string;
   json: boolean;
   detach: boolean;
+  verbose: boolean;
   timeoutMs: number;
   workspace?: string;
 }
@@ -42,10 +44,12 @@ function parse(argv: string[]): Parsed {
   let timeoutMs = 120_000;
   const positional: string[] = [];
   let detach = false;
+  let verbose = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === "--json") flags.add("json");
     else if (arg === "--detach") detach = true;
+    else if (arg === "--verbose" || arg === "-v") verbose = true;
     else if (arg === "--help" || arg === "-h") flags.add("help");
     else if (arg === "--workspace") workspace = argv[++i];
     else if (arg === "--timeout") timeoutMs = Number(argv[++i] ?? NaN);
@@ -53,10 +57,10 @@ function parse(argv: string[]): Parsed {
   }
   const json = flags.has("json");
   if (flags.has("help") || positional.length === 0) {
-    return { mode: "help", rawArgs: "", json, detach, timeoutMs };
+    return { mode: "help", rawArgs: "", json, detach, verbose, timeoutMs };
   }
   if (positional[0] === "tools") {
-    return { mode: "tools", rawArgs: "", json, detach, timeoutMs, workspace };
+    return { mode: "tools", rawArgs: "", json, detach, verbose, timeoutMs, workspace };
   }
   const [first, second, third] = positional;
   if (first === "call") {
@@ -66,11 +70,12 @@ function parse(argv: string[]): Parsed {
       rawArgs: third ?? "{}",
       json,
       detach,
+      verbose,
       timeoutMs,
       workspace,
     };
   }
-  return { mode: "call", tool: first, rawArgs: second ?? "{}", json, detach, timeoutMs, workspace };
+  return { mode: "call", tool: first, rawArgs: second ?? "{}", json, detach, verbose, timeoutMs, workspace };
 }
 
 async function readArgs(rawArgs: string): Promise<Record<string, unknown>> {
@@ -131,7 +136,8 @@ async function main(): Promise<void> {
     command: process.execPath,
     args: [serverPath],
     env,
-    stderr: "inherit",
+    // 服务端日志默认不往终端灌：它已经落在 ~/Library/Logs/gemini-space-stdio.log。
+    stderr: opts.verbose ? "inherit" : "ignore",
   });
   const client = new Client({ name: "gemini-space-call", version: "1.0.0" });
   await client.connect(transport);
@@ -145,7 +151,10 @@ async function main(): Promise<void> {
         process.stdout.write(`${JSON.stringify(tools, null, 2)}\n`);
       } else {
         for (const tool of tools) {
-          process.stdout.write(`${tool.name}\n  ${tool.description ?? ""}\n`);
+          // 描述里混着 \n / \r / U+2028 等分隔符，统一压成一行再截断。
+          const flat = (tool.description ?? "").replace(/\s+/g, " ").trim();
+          const summary = flat.length > 100 ? `${flat.slice(0, 99)}…` : flat;
+          process.stdout.write(`${tool.name.padEnd(13)} ${summary}\n`);
         }
       }
       return;
