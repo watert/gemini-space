@@ -354,7 +354,7 @@ function resolveBaseDir(
 }
 
 /** 含规则标记即视为规则根；命中第一个就停止上溯。 */
-function findRuleRoot(baseDir: string, home: string): string | null {
+export function findRuleRoot(baseDir: string, home: string): string | null {
   for (let dir = baseDir; ; dir = dirname(dir)) {
     // home 本身由 user 段负责，避免两段重复。
     if (dir === home) return null;
@@ -363,7 +363,7 @@ function findRuleRoot(baseDir: string, home: string): string | null {
   }
 }
 
-function hasRuleMarker(dir: string): boolean {
+export function hasRuleMarker(dir: string): boolean {
   for (const filename of RULE_FILENAMES) {
     try {
       if (statSync(join(dir, filename)).isFile()) return true;

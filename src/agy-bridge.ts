@@ -28,6 +28,7 @@ import {
   type AgyFunctionDeclaration,
 } from "./agy-tool-schemas.js";
 import { collectUserRules, formatUserRulesText, type UserRulesOptions } from "./user-rules.js";
+import { RuleHintTracker } from "./rule-hint.js";
 import type { AgyBridgeConfig } from "./config.js";
 import { commandPreview, logEvent, type LoggingConfig } from "./logger.js";
 import { cleanGeminiToolSchema } from "./schema-clean.js";
@@ -169,7 +170,7 @@ export function buildServerInstructions(
     "agy 风格的本地操作。如果默认的读写没有权限,可以尝试用这边的工具;如果用户没有提及目录,默认工作空间为 ~/docs/。",
     "These tools run directly on the owner's Mac with full local filesystem and zsh permissions, matching Antigravity (agy) tool semantics.",
     "Always pass absolute file paths to read_file, write_file, and edit_file; no workspace-open step is needed.",
-    "Before making changes in an unfamiliar directory, call `user_rules` with its absolute Path: it returns the AGENTS.md / CLAUDE.md chain and local skills that apply there. Read the listed files with read_file before acting.",
+    "Before making changes in an unfamiliar directory, call `user_rules` with its absolute Path: it returns the nearest AGENTS.md / CLAUDE.md rule root and local skills that apply there. Read the listed files with read_file before acting.",
     `Non-daemon run_command calls automatically wait on the server for up to ${holdSeconds} seconds so most commands finish in one call.`,
     `If run_command exceeds ${holdSeconds} seconds and returns a background task id, call manage_task with Action "status" and that TaskId: the server holds each status check up to ${holdSeconds} seconds until the task finishes. Repeat until completion when your task depends on the output.`,
     "Completion notices for background tasks in your session are also appended to subsequent tool results.",
@@ -192,6 +193,7 @@ export class AgyBridge {
   private readonly mcpSessions = new Map<string, McpSessionEntry>();
   private readonly sessionsByUuid = new Map<string, McpSessionEntry>();
   private readonly fileWriteLocks = new Map<string, Promise<void>>();
+  private readonly ruleHints = new RuleHintTracker(homedir());
   private gcTimer: NodeJS.Timeout | undefined;
   private closing = false;
 
@@ -356,9 +358,10 @@ export class AgyBridge {
       }
 
       targetEntry.pruneCompletedTasks();
+      const hint = !isError && name !== USER_RULES_TOOL_NAME ? this.probeRuleHint(name, args) : null;
       const extraNotices = targetEntry.takeFreshNotices(suppressNoticeForTask);
       const content: McpContentBlock[] = [
-        { type: "text", text: outText + extraNotices },
+        { type: "text", text: outText + (hint ?? "") + extraNotices },
         ...images.map((media): McpContentBlock => this.mediaToContentBlock(media, args)),
       ];
 
@@ -381,6 +384,18 @@ export class AgyBridge {
     }
 
     return execute();
+  }
+
+  private probeRuleHint(name: string, args: Record<string, unknown>): string | null {
+    if (name === "read_file" || name === "write_file" || name === "edit_file") {
+      for (const key of ["Path", "FilePath", "Target"] as const) {
+        const value = args[key];
+        if (typeof value === "string" && value.length > 0) return this.ruleHints.probe(value);
+      }
+      return null;
+    }
+    if (name === "run_command") return this.ruleHints.probe(this.config.workspace);
+    return null;
   }
 
   private mediaToContentBlock(media: InlineMediaItem, args: Record<string, unknown>): McpContentBlock {

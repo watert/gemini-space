@@ -321,7 +321,7 @@ export const USER_RULES_TOOL_NAME = "user_rules";
 export const USER_RULES_DECLARATION: AgyFunctionDeclaration = {
   name: USER_RULES_TOOL_NAME,
   description:
-    "List the AGENTS.md / CLAUDE.md rule files and local skills that apply to a path, walking up from it to the home directory. Call this before writing files or running commands in an unfamiliar directory, then read the listed files with read_file when you need their full text.",
+    "List the AGENTS.md / CLAUDE.md rule files and local skills that apply to a path. Finds the nearest project root that has rules (a directory containing AGENTS.md, CLAUDE.md, or a skills directory) and stops there; ~/.agents/AGENTS.md is always included. Call this before writing files or running commands in a project directory, then read the listed files with read_file when you need their full text.",
   parameters: {
     type: "OBJECT",
     properties: {
