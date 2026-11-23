@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import {
   executeManageTask,
   executeRunCommand,
@@ -76,6 +76,7 @@ class McpSessionEntry implements SessionTaskContext {
   private warnedCallCount = 0;
   readonly tasksByStep = new Map<number, ManagedTaskRecord>();
   readonly notices: SessionNoticeItem[] = [];
+  readonly ruleHints: RuleHintTracker;
 
   constructor(
     readonly mcpSessionId: string,
@@ -83,6 +84,9 @@ class McpSessionEntry implements SessionTaskContext {
     readonly workspace: string,
   ) {
     this.sessionUuid = deriveSessionUuid(mcpSessionId);
+    this.ruleHints = new RuleHintTracker(homedir(), {
+      statePath: join(stateRoot, "brain", this.sessionUuid, ".system_generated", "rule-hints.json"),
+    });
     // 从磁盘恢复 stepCounter：stdio 进程每轮重启，若从 -2 重新开始会覆盖上一轮同名任务。
     try {
       const existing = readTaskSidecars(this);
@@ -167,7 +171,7 @@ export function buildServerInstructions(
 ): string {
   const holdSeconds = Math.round(holdMs / 1000);
   const parts = [
-    "agy 风格的本地操作。如果默认的读写没有权限,可以尝试用这边的工具;如果用户没有提及目录,默认工作空间为 ~/docs/。",
+    "agy 风格的本地操作。已知工作区路径时,优先用客户端自带的读写执行工具,失败或无权限再改用这里的工具;如果工作区路径带 iCloud 且以 watert/user-docs 结尾,它就是 ~/docs,先调 user_rules 看规则与 skills。",
     "These tools run directly on the owner's Mac with full local filesystem and zsh permissions, matching Antigravity (agy) tool semantics.",
     "Always pass absolute file paths to read_file, write_file, and edit_file; no workspace-open step is needed.",
     "Before making changes in an unfamiliar directory, call `user_rules` with its absolute Path: it returns the nearest AGENTS.md / CLAUDE.md rule root and local skills that apply there. Read the listed files with read_file before acting.",
@@ -193,7 +197,6 @@ export class AgyBridge {
   private readonly mcpSessions = new Map<string, McpSessionEntry>();
   private readonly sessionsByUuid = new Map<string, McpSessionEntry>();
   private readonly fileWriteLocks = new Map<string, Promise<void>>();
-  private readonly ruleHints = new RuleHintTracker(homedir());
   private gcTimer: NodeJS.Timeout | undefined;
   private closing = false;
 
@@ -358,7 +361,15 @@ export class AgyBridge {
       }
 
       targetEntry.pruneCompletedTasks();
-      const hint = !isError && name !== USER_RULES_TOOL_NAME ? this.probeRuleHint(name, args) : null;
+      let hint: string | null = null;
+      if (!isError) {
+        if (name === USER_RULES_TOOL_NAME) {
+          const pathArg = typeof args.Path === "string" && args.Path.length > 0 ? args.Path : this.config.workspace;
+          targetEntry.ruleHints.markHinted(pathArg);
+        } else {
+          hint = this.probeRuleHint(targetEntry, name, args);
+        }
+      }
       const extraNotices = targetEntry.takeFreshNotices(suppressNoticeForTask);
       const content: McpContentBlock[] = [
         { type: "text", text: outText + (hint ?? "") + extraNotices },
@@ -386,15 +397,18 @@ export class AgyBridge {
     return execute();
   }
 
-  private probeRuleHint(name: string, args: Record<string, unknown>): string | null {
+  private probeRuleHint(entry: McpSessionEntry, name: string, args: Record<string, unknown>): string | null {
     if (name === "read_file" || name === "write_file" || name === "edit_file") {
       for (const key of ["Path", "FilePath", "Target"] as const) {
         const value = args[key];
-        if (typeof value === "string" && value.length > 0) return this.ruleHints.probe(value);
+        if (typeof value === "string" && value.length > 0) return entry.ruleHints.probe(value);
       }
       return null;
     }
-    if (name === "run_command") return this.ruleHints.probe(this.config.workspace);
+    if (name === "run_command") {
+      const cmd = typeof args.CommandLine === "string" ? args.CommandLine : undefined;
+      return entry.ruleHints.probeCommand(cmd, this.config.workspace);
+    }
     return null;
   }
 
